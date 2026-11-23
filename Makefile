@@ -7,10 +7,21 @@
 # The library itself is the single header xbmfont.h: nothing to build or link
 # besides -lX11.
 
+# Keep the previous behaviour: i386 toolchains link statically unless told otherwise.
+TARGET_MACHINE := $(shell $(CC) -dumpmachine)
+ifneq ($(findstring i386,$(TARGET_MACHINE)),)
+    STATIC ?= 1
+endif
+
 CC      ?= gcc
 CFLAGS  ?= -Os
-CFLAGS  += -std=gnu99 -Wall -Wextra -Wshadow -I.
+CFLAGS  += -std=gnu99 -Wall -Wextra -Wshadow -ffunction-sections -fdata-sections -I.
+LDFLAGS += -Wl,--gc-sections,--sort-common,-s
 LDLIBS  += -lX11
+
+ifeq ($(STATIC),1)
+    LDFLAGS += -static
+endif
 
 FONTS = 5x8 6x10 6x13 7x14 9x15 9x18 10x20
 
