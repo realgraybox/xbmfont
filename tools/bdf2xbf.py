@@ -2,11 +2,17 @@
 """bdf2xbf.py - convert a monospaced BDF bitmap font into an xbmfont C header.
 
 Usage:
-    python3 bdf2xbf.py FONT.bdf NAME OUTPUT.h [--license FILE]
+    python3 bdf2xbf.py FONT.bdf NAME OUTPUT.h [--extra RANGES] [--license FILE]
 
 NAME becomes the C identifier, e.g. "fixed_6x13" -> xbf_fixed_6x13.
-Only code points 0x20-0xFF (ASCII + Latin-1) are taken; glyphs the font lacks
-are marked missing and drawn as '?' by the library.
+Code points 0x20-0xFF (ASCII + Latin-1) always form the main table; glyphs the
+font lacks there are marked missing and drawn as '?' by the library.
+
+--extra adds a sparse set of further code points, as hex ranges such as
+"0100-017F,20AC". "default" (the default) is Latin Extended-A, the rest of
+Windows-1252 (curly quotes, dashes, ellipsis, euro, ...), arrows and a few UI
+symbols - see DEFAULT_EXTRA. "none" leaves them out. Extra code points the
+font does not have are simply not included.
 
 Licence check: a font is only converted if its COPYRIGHT property says
 "Public domain". For a font under another licence, pass the licence text with
@@ -22,6 +28,36 @@ import re
 import sys
 
 FIRST, LAST = 0x20, 0xFF
+
+DEFAULT_EXTRA = ",".join([
+    "0100-017F",              # Latin Extended-A: Central European, Baltic, Turkish ...
+    "0192,0218-021B",         # f hook, Romanian S/T comma
+    "02C6-02C7,02D8-02DD",    # spacing accents (Windows-1252 circumflex, tilde ...)
+    "2010-2015,2018-201E",    # hyphens, dashes, curly quotes
+    "2020-2022,2026,2030",    # daggers, bullet, ellipsis, per mille
+    "2039-203A,20AC,2122",    # single guillemets, euro, trade mark
+    "2190-2193,2212",         # arrows, minus
+    "25A0,25B2,25B6,25BC,25C0",  # square, triangles (stop, up, play, down, back)
+    "266A-266B,2713",         # notes, check mark
+])
+
+
+def parse_ranges(text):
+    if text == "none":
+        return []
+    if text == "default":
+        text = DEFAULT_EXTRA
+    cps = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        lo, hi = int(a, 16), int(b or a, 16)
+        if lo > hi or hi > 0xFFFF:
+            sys.exit("bad range %r (code points up to FFFF)" % part)
+        cps.update(range(lo, hi + 1))
+    return sorted(c for c in cps if c > LAST)
 
 
 def parse_bdf(path):
@@ -63,11 +99,25 @@ def parse_bdf(path):
     return props, glyphs
 
 
+def compact(cps):
+    """[0x100, 0x101, 0x102, 0x20AC] -> "0100-0102 20AC" """
+    out, i = [], 0
+    while i < len(cps):
+        j = i
+        while j + 1 < len(cps) and cps[j + 1] == cps[j] + 1:
+            j += 1
+        out.append("%04X" % cps[i] if i == j else "%04X-%04X" % (cps[i], cps[j]))
+        i = j + 1
+    return " ".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("bdf")
     ap.add_argument("name", help="C name without the xbf_ prefix, e.g. fixed_6x13")
     ap.add_argument("output")
+    ap.add_argument("--extra", metavar="RANGES", default="default",
+                    help='extra code points: hex ranges, "default" or "none"')
     ap.add_argument("--license", metavar="FILE",
                     help="licence text of a font that is not public domain")
     a = ap.parse_args()
@@ -95,15 +145,20 @@ def main():
         sys.exit("FONT_ASCENT / FONT_DESCENT missing")
     height = ascent + descent
 
+    extra = [c for c in parse_ranges(a.extra) if c in glyphs]
+
     widths = {g["dwidth"] for c, g in glyphs.items() if FIRST <= c <= LAST and "dwidth" in g}
     if len(widths) != 1:
         sys.exit("not a monospaced font in 0x20-0xFF (advances: %s)" % sorted(widths))
     width = widths.pop()
+    odd = [c for c in extra if glyphs[c].get("dwidth", width) != width]
+    if odd:   # e.g. double-width glyphs: leave them out
+        extra = [c for c in extra if c not in odd]
     row_bytes = (width + 7) // 8
 
     out_rows = []      # per glyph: list of row byte-lists
     missing = []
-    for c in range(FIRST, LAST + 1):
+    for c in list(range(FIRST, LAST + 1)) + extra:
         g = glyphs.get(c)
         cell = [[0] * width for _ in range(height)]
         if g is None:
@@ -150,15 +205,17 @@ def main():
     o.append(" * Cell %dx%d, ascent %d, code points 0x%02X-0x%02X%s" % (
         width, height, ascent, FIRST, LAST,
         (", missing: " + " ".join("0x%02X" % c for c in real_missing)) if real_missing else ""))
+    if extra:
+        o.append(" * Extra: %d code points %s" % (len(extra), compact(extra)))
     o.append(" */")
     o.append("#ifndef %s" % guard)
     o.append("#define %s" % guard)
     o.append("")
     o.append('#include "xbmfont.h"')
     o.append("")
-    o.append("static const unsigned char %s_bits[%d] = {" % (cname, (LAST - FIRST + 1) * height * row_bytes))
-    for idx, rows in enumerate(out_rows):
-        c = FIRST + idx
+    order = list(range(FIRST, LAST + 1)) + extra
+    o.append("static const unsigned char %s_bits[%d] = {" % (cname, len(order) * height * row_bytes))
+    for c, rows in zip(order, out_rows):
         flat = ",".join("0x%02x" % v for rb in rows for v in rb)
         label = chr(c) if 0x20 < c < 0x7F and chr(c) not in "\\*/" else "U+%04X" % c
         o.append("    %s, /* %s */" % (flat, label))
@@ -170,18 +227,24 @@ def main():
             bitset[i // 8] |= 1 << (i % 8)
         o.append("static const unsigned char %s_missing[%d] = {%s};" % (
             cname, len(bitset), ",".join("0x%02x" % v for v in bitset)))
+    if extra:
+        o.append("static const unsigned short %s_extra[%d] = {" % (cname, len(extra)))
+        for k in range(0, len(extra), 12):
+            o.append("    " + ",".join("0x%04X" % c for c in extra[k:k + 12]) + ",")
+        o.append("};")
     o.append("")
     o.append("static const xbf_font %s = {" % cname)
-    o.append('    "%s", %d, %d, %d, 0x%02X, %d, %s_bits, %s' % (
+    o.append('    "%s", %d, %d, %d, 0x%02X, %d, %s_bits, %s, %d, %s' % (
         a.name.replace("_", " "), width, height, ascent, FIRST, LAST - FIRST + 1,
-        cname, (cname + "_missing") if missing else "0"))
+        cname, (cname + "_missing") if missing else "0",
+        len(extra), (cname + "_extra") if extra else "0"))
     o.append("};")
     o.append("")
     o.append("#endif")
     with open(a.output, "w") as f:
         f.write("\n".join(o) + "\n")
-    print("%s: %dx%d ascent %d, %d glyphs%s" % (
-        a.output, width, height, ascent, LAST - FIRST + 1 - len(missing),
+    print("%s: %dx%d ascent %d, %d + %d extra glyphs%s" % (
+        a.output, width, height, ascent, LAST - FIRST + 1 - len(missing), len(extra),
         (", missing " + " ".join("0x%02X" % c for c in real_missing)) if real_missing else ""))
 
 

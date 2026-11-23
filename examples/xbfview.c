@@ -77,7 +77,15 @@ static const char sample[] =
     "\n"
     "Danish (UTF-8): blåbærgrød med fløde - Æbleskiver, Øresund, Århus\n"
     "Latin-1 bytes (not UTF-8): \xe6\xf8\xe5 \xc6\xd8\xc5\n"
-    "Not in the font: \xe2\x82\xac \xe2\x99\xaa \xe2\x86\x92\n"
+    "Windows-1252 bytes: \x93quoted\x94 \x96 \x80""5 \x85\n"
+    "\n"
+    "Latin Extended-A: Dvořák, Chopin's Życie, Łódź, Mozart in Brno - Kraków\n"
+    "  Ő ő Ű ű Š š Č č Ž ž Ę ę Ā ā Ğ ğ İ ı Ş ş Œ œ Ÿ\n"
+    "Punctuation: \u201ccurly\u201d \u2018quotes\u2019 \u201elow\u201c en\u2013dash em\u2014dash \u2026 \u2022 \u2020 \u20ac \u2122 \u2030\n"
+    "Symbols: \u2190 \u2191 \u2192 \u2193  \u25b6 \u25a0 \u25c0 \u25b2 \u25bc  \u266a \u266b  \u2713\n"
+    "Not in the font: \u65e5\u672c \u0416 \u03a9\n"
+    "\n"
+    "A long line is cut with an ellipsis at the window edge: Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.\n"
     "Tab:\tafter a tab\n";
 
 typedef struct { const char *s; int n; } line_t;
@@ -268,17 +276,23 @@ int main(int argc, char **argv)
             XFillRectangle(dpy, back, gc, 0, 0, (unsigned)W, (unsigned)H);
             y = 2 + xbf_ascent(txt);
             for (i = top; i < nlines && i < top + visible; i++, y += lh)
-                xbf_draw_n(txt, back, 6, y, fg, lines[i].s, lines[i].n);
+                xbf_draw_fit_n(txt, back, 6, y, fg, lines[i].s, lines[i].n, W - 12, XBF_CUT_END);
 
             XSetForeground(dpy, gc, barbg);
             XFillRectangle(dpy, back, gc, 0, H - barh, (unsigned)W, (unsigned)barh);
-            snprintf(status, sizeof status, " %s  |  %s x%d (line %d px)%s  |  lines %d-%d of %d",
-                     path ? path : "sample", sizes[cur].font->name, sizes[cur].scale, lh,
-                     autosize ? " auto" : "", nlines ? top + 1 : 0,
-                     top + visible < nlines ? top + visible : nlines, nlines);
-            xbf_draw(bar, back, 4, H - barh + 4 + xbf_ascent(bar), 0xFFFFFF, status);
-            xbf_draw(bar, back, W - xbf_text_width(bar, "+/- size  a auto  q quit ") - 4,
-                     H - barh + 4 + xbf_ascent(bar), dim, "+/- size  a auto  q quit ");
+            /* status: file name (cut in the middle if needed), size, keys */
+            {
+                static const char keys[] = "+/- size  a auto  q quit ";
+                int by = H - barh + 4 + xbf_ascent(bar), kw = xbf_text_width(bar, keys), x;
+                snprintf(status, sizeof status, "  |  %s x%d (line %d px)%s  |  lines %d-%d of %d",
+                         sizes[cur].font->name, sizes[cur].scale, lh, autosize ? " auto" : "",
+                         nlines ? top + 1 : 0, top + visible < nlines ? top + visible : nlines,
+                         nlines);
+                x = 4 + xbf_draw_fit(bar, back, 4, by, 0xFFFFFF, path ? path : "sample",
+                                     W - 16 - kw - xbf_text_width(bar, status), XBF_CUT_MIDDLE);
+                xbf_draw_fit(bar, back, x, by, 0xFFFFFF, status, W - 12 - kw - x, XBF_CUT_END);
+                xbf_draw(bar, back, W - kw - 4, by, dim, keys);
+            }
 
             XCopyArea(dpy, back, win, gc, 0, 0, (unsigned)W, (unsigned)H, 0, 0);
             XFlush(dpy);

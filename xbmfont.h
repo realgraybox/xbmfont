@@ -13,9 +13,12 @@
  *     xbf_draw(t, window, 10, 30, 0xFFFFFF, "Hello, æøå!");
  *     xbf_free(t);
  *
- * Text is UTF-8. Code points the font has (fonts/ are ASCII + Latin-1) are
- * drawn; others, and control characters, are drawn as '?'. A byte that is not
- * valid UTF-8 is taken as Latin-1, so old Latin-1 file names still show right.
+ * Text is UTF-8. Code points the font has are drawn; others, and control
+ * characters, are drawn as '?'. The bundled fonts have ASCII, Latin-1, Latin
+ * Extended-A, the curly quotes, dashes, euro etc. of Windows-1252, arrows and a
+ * few symbols. A byte that is not valid UTF-8 is taken as Windows-1252 (Latin-1
+ * plus quotes and dashes in 0x80-0x9F), so old 8-bit file names and MIDI
+ * texts still show right.
  * Coordinates are like XDrawString: x is the left edge, y the baseline.
  *
  * How it works: xbf_create() uploads all glyphs of one font at one scale to
@@ -55,7 +58,16 @@ typedef struct {
     int first, count;               /* code points first .. first+count-1 */
     const unsigned char *bits;      /* count glyphs x height rows x (width+7)/8 bytes, MSB = left */
     const unsigned char *missing;   /* bit per glyph: 1 = not in the font; 0 = none missing */
+    int extra_count;                /* further glyphs, stored after the first `count` */
+    const unsigned short *extra;    /* their code points, ascending */
 } xbf_font;
+
+/* How xbf_draw_fit shortens text that is too wide */
+enum {
+    XBF_CUT_END = 0,        /* "A long title th..." */
+    XBF_CUT_MIDDLE = 1,     /* "/home/me/.../song.mid" */
+    XBF_CUT_START = 2       /* ".../midi/song.mid" */
+};
 
 typedef struct xbf_ctx xbf_ctx;
 
@@ -70,6 +82,25 @@ XBFDEF void xbf_free(xbf_ctx *ctx);
 XBFDEF int xbf_draw(xbf_ctx *ctx, Drawable d, int x, int y, unsigned long pixel, const char *utf8);
 XBFDEF int xbf_draw_n(xbf_ctx *ctx, Drawable d, int x, int y, unsigned long pixel,
                       const char *utf8, int bytes);
+
+/* Draw text into at most `max_px` pixels: if it is too wide, part of it is
+   replaced by an ellipsis (U+2026 if the font has it, else "..."), at the end,
+   in the middle or at the start (XBF_CUT_*). Draws nothing if not even the
+   ellipsis fits. Returns the width drawn; xbf_fit_width gives the same width
+   without drawing, e.g. to right-align. The _n variants take a byte count. */
+XBFDEF int xbf_draw_fit(xbf_ctx *ctx, Drawable d, int x, int y, unsigned long pixel,
+                        const char *utf8, int max_px, int cut);
+XBFDEF int xbf_draw_fit_n(xbf_ctx *ctx, Drawable d, int x, int y, unsigned long pixel,
+                          const char *utf8, int bytes, int max_px, int cut);
+XBFDEF int xbf_fit_width(const xbf_ctx *ctx, const char *utf8, int max_px);
+XBFDEF int xbf_fit_width_n(const xbf_ctx *ctx, const char *utf8, int bytes, int max_px);
+
+/* Bytes of the longest start of `utf8` (`bytes` long) that fits in `max_px`
+   pixels, never splitting a character - e.g. for wrapping lines. */
+XBFDEF int xbf_fit_bytes(const xbf_ctx *ctx, const char *utf8, int bytes, int max_px);
+
+/* 1 if the font has a glyph for code point `cp` (others are drawn as '?') */
+XBFDEF int xbf_font_has(const xbf_font *font, unsigned long cp);
 
 /* Measurements in pixels, at the context's scale */
 XBFDEF int xbf_text_width(const xbf_ctx *ctx, const char *utf8);
@@ -103,7 +134,7 @@ XBFDEF const xbf_font *xbf_pick(const xbf_font *const *fonts, int n, int line_px
 #include <stdlib.h>
 #include <string.h>
 
-#define XBF_COLS 16         /* glyphs per row in the uploaded pixmap */
+#define XBF_COLS 32         /* glyphs per row in the uploaded pixmap */
 #define XBF_MAX_SCALE 16
 
 struct xbf_ctx {
@@ -123,40 +154,68 @@ static int xbf__missing(const xbf_font *f, int i)
     return f->missing && (f->missing[i >> 3] >> (i & 7) & 1);
 }
 
-/* Glyph index for a code point; -1 = draw nothing */
-static int xbf__index(const xbf_font *f, unsigned long cp)
+/* Glyph index for a code point, or -1 if the font does not have it */
+static int xbf__find(const xbf_font *f, unsigned long cp)
 {
+    int lo = 0, hi = f->extra_count - 1;
+
     if (cp >= (unsigned long)f->first && cp < (unsigned long)(f->first + f->count)) {
         int i = (int)(cp - (unsigned long)f->first);
-        if (!xbf__missing(f, i)) return i;
+        return xbf__missing(f, i) ? -1 : i;
     }
-    if ('?' >= f->first && '?' < f->first + f->count && !xbf__missing(f, '?' - f->first))
-        return '?' - f->first;
+    while (f->extra && lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (f->extra[mid] == cp) return f->count + mid;
+        if (f->extra[mid] < cp) lo = mid + 1;
+        else hi = mid - 1;
+    }
     return -1;
 }
 
-/* Next code point from UTF-8; an invalid byte is returned as Latin-1 */
+/* Glyph index to draw for a code point: '?' if missing; -1 = draw nothing */
+static int xbf__index(const xbf_font *f, unsigned long cp)
+{
+    int g = cp < 0x20 ? -1 : xbf__find(f, cp);
+    return g >= 0 ? g : xbf__find(f, '?');
+}
+
+/* Windows-1252 0x80-0x9F; 0 = undefined there */
+static const unsigned short xbf__cp1252[32] = {
+    0x20AC, 0, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0, 0x017D, 0,
+    0, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0, 0x017E, 0x0178
+};
+
+/* A byte that is not part of valid UTF-8, as Windows-1252 */
+static unsigned long xbf__byte(unsigned char b)
+{
+    if (b >= 0x80 && b < 0xA0 && xbf__cp1252[b - 0x80]) return xbf__cp1252[b - 0x80];
+    return b;
+}
+
+/* Next code point from UTF-8; an invalid byte is taken as Windows-1252 */
 static unsigned long xbf__next(const unsigned char **p, const unsigned char *end)
 {
     const unsigned char *s = *p;
     unsigned long cp;
     int n, k;
 
-    if (s[0] < 0x80) { *p = s + 1; return s[0]; }
+    *p = s + 1;
+    if (s[0] < 0x80) return s[0];
     if ((s[0] & 0xE0) == 0xC0) { n = 1; cp = s[0] & 0x1F; }
     else if ((s[0] & 0xF0) == 0xE0) { n = 2; cp = s[0] & 0x0F; }
     else if ((s[0] & 0xF8) == 0xF0) { n = 3; cp = s[0] & 0x07; }
-    else { *p = s + 1; return s[0]; }
-    if (end - s <= n) { *p = s + 1; return s[0]; }
+    else return xbf__byte(s[0]);
+    if (end - s <= n) return xbf__byte(s[0]);
     for (k = 1; k <= n; k++) {
-        if ((s[k] & 0xC0) != 0x80) { *p = s + 1; return s[0]; }
+        if ((s[k] & 0xC0) != 0x80) return xbf__byte(s[0]);
         cp = (cp << 6) | (s[k] & 0x3F);
     }
-    /* overlong forms are not valid UTF-8: treat the lead byte as Latin-1 */
-    if ((n == 1 && cp < 0x80) || (n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000)) {
-        *p = s + 1;
-        return s[0];
-    }
+    /* overlong forms, surrogates and values above U+10FFFF are not valid */
+    if ((n == 1 && cp < 0x80) || (n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) ||
+        (cp >= 0xD800 && cp < 0xE000) || cp > 0x10FFFF)
+        return xbf__byte(s[0]);
     *p = s + n + 1;
     return cp;
 }
@@ -164,11 +223,12 @@ static unsigned long xbf__next(const unsigned char **p, const unsigned char *end
 XBFDEF xbf_ctx *xbf_create(Display *dpy, Drawable like, const xbf_font *font, int scale)
 {
     xbf_ctx *c;
-    int rows, aw, ah, abytes, rb, g, x, y, sx, sy;
+    int total, rows, aw, ah, abytes, rb, g, x, y, sx, sy;
     unsigned char *buf;
     XGCValues v;
 
     if (!dpy || !font || font->count <= 0) return NULL;
+    total = font->count + (font->extra ? font->extra_count : 0);
     if (scale < 1) scale = 1;
     if (scale > XBF_MAX_SCALE) scale = XBF_MAX_SCALE;
 
@@ -179,9 +239,9 @@ XBFDEF xbf_ctx *xbf_create(Display *dpy, Drawable like, const xbf_font *font, in
     c->scale = scale;
     c->cw = font->width * scale;
     c->ch = font->height * scale;
-    c->empty = (unsigned char *)calloc((size_t)font->count, 1);
+    c->empty = (unsigned char *)calloc((size_t)total, 1);
 
-    rows = (font->count + XBF_COLS - 1) / XBF_COLS;
+    rows = (total + XBF_COLS - 1) / XBF_COLS;
     aw = XBF_COLS * c->cw;
     ah = rows * c->ch;
     abytes = (aw + 7) / 8;                  /* XBM rows: LSB = left pixel */
@@ -194,7 +254,7 @@ XBFDEF xbf_ctx *xbf_create(Display *dpy, Drawable like, const xbf_font *font, in
         return NULL;
     }
 
-    for (g = 0; g < font->count; g++) {
+    for (g = 0; g < total; g++) {
         const unsigned char *src = font->bits + (size_t)g * font->height * rb;
         int ox = (g % XBF_COLS) * c->cw, oy = (g / XBF_COLS) * c->ch, blank = 1;
         for (y = 0; y < font->height; y++) {
@@ -251,7 +311,7 @@ XBFDEF int xbf_draw_n(xbf_ctx *c, Drawable d, int x, int y, unsigned long pixel,
     }
     while (p < end) {
         unsigned long cp = xbf__next(&p, end);
-        int g = xbf__index(c->font, cp < 0x20 ? '?' : cp);
+        int g = xbf__index(c->font, cp);
         if (g >= 0 && !c->empty[g]) {
             int gx = (g % XBF_COLS) * c->cw, gy = (g / XBF_COLS) * c->ch;
             XSetTSOrigin(c->dpy, c->gc, x - gx, top - gy);
@@ -288,6 +348,78 @@ XBFDEF int xbf_text_width_n(const xbf_ctx *c, const char *utf8, int bytes)
 XBFDEF int xbf_text_width(const xbf_ctx *c, const char *utf8)
 {
     return utf8 ? xbf_text_width_n(c, utf8, (int)strlen(utf8)) : 0;
+}
+
+/* Pointer after `n` characters, but not past `end` */
+static const char *xbf__skip(const char *utf8, const char *end, int n)
+{
+    const unsigned char *p = (const unsigned char *)utf8;
+    while (n-- > 0 && p < (const unsigned char *)end) xbf__next(&p, (const unsigned char *)end);
+    return (const char *)p;
+}
+
+XBFDEF int xbf_fit_bytes(const xbf_ctx *c, const char *utf8, int bytes, int max_px)
+{
+    if (!c || !utf8 || bytes <= 0 || max_px < c->cw) return 0;
+    return (int)(xbf__skip(utf8, utf8 + bytes, max_px / c->cw) - utf8);
+}
+
+XBFDEF int xbf_font_has(const xbf_font *f, unsigned long cp)
+{
+    return f && xbf__find(f, cp) >= 0;
+}
+
+/* The ellipsis for a context: U+2026 if the font has it, else three dots */
+static const char *xbf__ellipsis(const xbf_ctx *c, int *chars)
+{
+    if (xbf__find(c->font, 0x2026) >= 0) { *chars = 1; return "\xE2\x80\xA6"; }
+    *chars = 3;
+    return "...";
+}
+
+XBFDEF int xbf_fit_width_n(const xbf_ctx *c, const char *utf8, int bytes, int max_px)
+{
+    int n, m, e;
+    if (!c || !utf8 || bytes <= 0 || max_px <= 0) return 0;
+    n = xbf__count(utf8, bytes);
+    m = max_px / c->cw;
+    if (n <= m) return n * c->cw;
+    xbf__ellipsis(c, &e);
+    return m < e ? 0 : m * c->cw;
+}
+
+XBFDEF int xbf_fit_width(const xbf_ctx *c, const char *utf8, int max_px)
+{
+    return utf8 ? xbf_fit_width_n(c, utf8, (int)strlen(utf8), max_px) : 0;
+}
+
+XBFDEF int xbf_draw_fit_n(xbf_ctx *c, Drawable d, int x, int y, unsigned long pixel,
+                          const char *utf8, int bytes, int max_px, int cut)
+{
+    const char *end, *ell, *a, *b;
+    int n, m, e, keep, head, x0 = x;
+
+    if (!c || !utf8 || bytes <= 0 || max_px <= 0) return 0;
+    end = utf8 + bytes;
+    n = xbf__count(utf8, (int)(end - utf8));
+    m = max_px / c->cw;
+    if (n <= m) return xbf_draw_n(c, d, x, y, pixel, utf8, (int)(end - utf8));
+    ell = xbf__ellipsis(c, &e);
+    if (m < e) return 0;
+    keep = m - e;                       /* characters of the text that fit */
+    head = cut == XBF_CUT_START ? 0 : cut == XBF_CUT_MIDDLE ? (keep + 1) / 2 : keep;
+    a = xbf__skip(utf8, end, head);                 /* end of the head */
+    b = xbf__skip(utf8, end, n - (keep - head));    /* start of the tail */
+    x += xbf_draw_n(c, d, x, y, pixel, utf8, (int)(a - utf8));
+    x += xbf_draw(c, d, x, y, pixel, ell);
+    x += xbf_draw_n(c, d, x, y, pixel, b, (int)(end - b));
+    return x - x0;
+}
+
+XBFDEF int xbf_draw_fit(xbf_ctx *c, Drawable d, int x, int y, unsigned long pixel,
+                        const char *utf8, int max_px, int cut)
+{
+    return utf8 ? xbf_draw_fit_n(c, d, x, y, pixel, utf8, (int)strlen(utf8), max_px, cut) : 0;
 }
 
 XBFDEF int xbf_char_width(const xbf_ctx *c)  { return c ? c->cw : 0; }
